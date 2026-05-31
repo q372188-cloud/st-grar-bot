@@ -662,6 +662,17 @@ async function createWatchSetup(symbol, gex, radar) {
     status: 'WATCHING'
   };
 
+const readyNow =
+  setup.side === 'CALL'
+    ? setup.currentPrice >= setup.entry
+    : setup.currentPrice <= setup.entry;
+
+if (readyNow) {
+  console.log('READY NOW SETUP:', setupKey);
+  await sendActivatedMessage(setup, setup.currentPrice);
+  return;
+}
+  
   activeSetups.set(setupKey, setup);
 
   await sendWatchMessage(setup, gex, radar);
