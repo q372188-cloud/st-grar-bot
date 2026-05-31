@@ -27,7 +27,6 @@ const MIN_SCORE = Number(process.env.MIN_SCORE || 7);
 
 const MIN_CONTRACT_PRICE = Number(process.env.MIN_CONTRACT_PRICE || 1.50);
 const MAX_CONTRACT_PRICE = Number(process.env.MAX_CONTRACT_PRICE || 2.50);
-const STRIKE_SEARCH_STEPS = Number(process.env.STRIKE_SEARCH_STEPS || 8);
 
 const CONTRACT_UPDATE_STEP = Number(process.env.CONTRACT_UPDATE_STEP || 0.10);
 const CONTRACT_STOP_DROP = Number(process.env.CONTRACT_STOP_DROP || 0.30);
@@ -152,6 +151,7 @@ function extractEntry(text, side) {
     const m =
       text.match(/اختراق\s+([0-9]+(?:\.[0-9]+)?)/) ||
       text.match(/الدخول\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?)/);
+
     if (m) return Number(m[1]);
   }
 
@@ -159,6 +159,7 @@ function extractEntry(text, side) {
     const m =
       text.match(/كسر\s+([0-9]+(?:\.[0-9]+)?)/) ||
       text.match(/الدخول\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?)/);
+
     if (m) return Number(m[1]);
   }
 
@@ -169,6 +170,7 @@ function extractTargets(text) {
   const tp1 = extractNumberAfter('TP1', text);
   const tp2 = extractNumberAfter('TP2', text);
   const tp3 = extractNumberAfter('TP3', text);
+
   return { tp1, tp2, tp3 };
 }
 
@@ -219,21 +221,6 @@ function getStrikeFromEntry(entry, side) {
   return null;
 }
 
-function buildOptionTicker(symbol, expiration, side, strike) {
-  if (!symbol || !expiration || !strike || !['CALL', 'PUT'].includes(side)) return null;
-
-  const [yyyy, mm, dd] = String(expiration).split('-');
-  if (!yyyy || !mm || !dd) return null;
-
-  const yy = yyyy.slice(2);
-  const cp = side === 'CALL' ? 'C' : 'P';
-
-  const strikeNum = Math.round(Number(strike) * 1000);
-  const strikeText = String(strikeNum).padStart(8, '0');
-
-  return `O:${symbol}${yy}${mm}${dd}${cp}${strikeText}`;
-}
-
 function getOptionMid(snap) {
   const q = snap?.last_quote || {};
   const t = snap?.last_trade || {};
@@ -243,10 +230,16 @@ function getOptionMid(snap) {
   const last = Number(t.price || t.p || 0);
 
   let mid = 0;
-  if (bid > 0 && ask > 0) mid = (bid + ask) / 2;
-  else if (last > 0) mid = last;
-  else if (ask > 0) mid = ask;
-  else if (bid > 0) mid = bid;
+
+  if (bid > 0 && ask > 0) {
+    mid = (bid + ask) / 2;
+  } else if (last > 0) {
+    mid = last;
+  } else if (ask > 0) {
+    mid = ask;
+  } else if (bid > 0) {
+    mid = bid;
+  }
 
   return {
     bid,
@@ -259,6 +252,7 @@ function getOptionMid(snap) {
     gamma: snap?.greeks?.gamma ?? null
   };
 }
+
 // =====================
 // API
 // =====================
@@ -299,67 +293,136 @@ async function getMassiveOptionSnapshot(symbol, optionTicker) {
   return result;
 }
 
+async function getMassiveOptionChain(symbol, expiration, side) {
+  if (!MASSIVE_API_KEY) {
+    throw new Error('Missing MASSIVE_API_KEY');
+  }
+
+  const contractType = side === 'CALL' ? 'call' : 'put';
+
+  let url =
+    `${MASSIVE_BASE_URL}/v3/snapshot/options/${encodeURIComponent(symbol)}` +
+    `?expiration_date=${encodeURIComponent(expiration)}` +
+    `&contract_type=${encodeURIComponent(contractType)}` +
+    `&limit=250` +
+    `&apiKey=${MASSIVE_API_KEY}`;
+
+  const all = [];
+
+  while (url) {
+    const res = await axios.get(url, { timeout: 20000 });
+    const results = Array.isArray(res.data?.results) ? res.data.results : [];
+
+    all.push(...results);
+
+    url = res.data?.next_url
+      ? `${res.data.next_url}&apiKey=${MASSIVE_API_KEY}`
+      : null;
+  }
+
+  return all;
+}
+// =====================
+// Option Selection
+// =====================
+
+function normalizeChainContract(item) {
+  const details = item?.details || {};
+  const optionData = getOptionMid(item);
+
+  return {
+    optionTicker: details.ticker || item.ticker || null,
+    strike: Number(details.strike_price || item.strike_price || 0),
+    expiration: details.expiration_date || null,
+    contractType: details.contract_type || null,
+
+    bid: optionData.bid,
+    ask: optionData.ask,
+    last: optionData.last,
+    mid: optionData.mid,
+
+    volume: optionData.volume,
+    oi: optionData.oi,
+    delta: optionData.delta,
+    gamma: optionData.gamma
+  };
+}
+
+function scoreOptionContract(c, preferredStrike, side) {
+  const distance = Math.abs(c.strike - preferredStrike);
+
+  const volumeScore = Math.min(Number(c.volume || 0) / 1000, 3);
+  const oiScore = Math.min(Number(c.oi || 0) / 3000, 3);
+
+  let deltaScore = 0;
+  const delta = Number(c.delta);
+
+  if (!isNaN(delta)) {
+    if (side === 'CALL') {
+      if (delta >= 0.30 && delta <= 0.55) {
+        deltaScore = 3;
+      } else if (delta >= 0.20 && delta <= 0.65) {
+        deltaScore = 1.5;
+      }
+    }
+
+    if (side === 'PUT') {
+      if (delta <= -0.30 && delta >= -0.55) {
+        deltaScore = 3;
+      } else if (delta <= -0.20 && delta >= -0.65) {
+        deltaScore = 1.5;
+      }
+    }
+  }
+
+  const spread = Number(c.ask || 0) - Number(c.bid || 0);
+  let spreadPenalty = 0;
+
+  if (c.bid > 0 && c.ask > 0) {
+    spreadPenalty = Math.min(spread / 0.10, 2);
+  }
+
+  const distancePenalty = distance * 0.15;
+
+  return volumeScore + oiScore + deltaScore - distancePenalty - spreadPenalty;
+}
+
 async function findBestOptionContract(symbol, expiration, side, preferredStrike) {
   if (!preferredStrike || !expiration) return null;
 
-  const step = getStrikeStep(preferredStrike);
-  const candidates = [];
+  let chain = [];
 
-  for (let i = 0; i <= STRIKE_SEARCH_STEPS; i++) {
-    if (i === 0) {
-      candidates.push(preferredStrike);
-    } else {
-      if (side === 'CALL') {
-        candidates.push(preferredStrike + step * i);
-        candidates.push(preferredStrike - step * i);
-      }
-
-      if (side === 'PUT') {
-        candidates.push(preferredStrike - step * i);
-        candidates.push(preferredStrike + step * i);
-      }
-    }
+  try {
+    chain = await getMassiveOptionChain(symbol, expiration, side);
+  } catch (err) {
+    console.error('OPTION CHAIN ERROR:', symbol, expiration, side, err.message);
+    return null;
   }
 
-  const uniqueStrikes = [...new Set(candidates)]
-    .filter(x => x > 0)
-    .sort((a, b) => Math.abs(a - preferredStrike) - Math.abs(b - preferredStrike));
+  const normalized = chain
+    .map(normalizeChainContract)
+    .filter(c =>
+      c.optionTicker &&
+      c.strike > 0 &&
+      c.mid >= MIN_CONTRACT_PRICE &&
+      c.mid <= MAX_CONTRACT_PRICE
+    );
 
-  let fallback = null;
-
-  for (const strike of uniqueStrikes) {
-    const optionTicker = buildOptionTicker(symbol, expiration, side, strike);
-    if (!optionTicker) continue;
-
-    try {
-      const snap = await getMassiveOptionSnapshot(symbol, optionTicker);
-      const optionData = getOptionMid(snap);
-
-      if (!optionData.mid) continue;
-
-      const item = {
-        optionTicker,
-        strike,
-        ...optionData,
-        distanceFromPreferred: Math.abs(strike - preferredStrike)
-      };
-
-      if (!fallback || item.distanceFromPreferred < fallback.distanceFromPreferred) {
-        fallback = item;
-      }
-
-      if (
-        optionData.mid >= MIN_CONTRACT_PRICE &&
-        optionData.mid <= MAX_CONTRACT_PRICE
-      ) {
-        return item;
-      }
-    } catch (err) {
-      console.error('STRIKE CHECK ERROR:', optionTicker, err.message);
-    }
+  if (!normalized.length) {
+    console.log(`NO CHAIN CONTRACT IN RANGE ${symbol} ${expiration} ${side}`);
+    return null;
   }
 
-  return fallback;
+  normalized.sort((a, b) => {
+    const scoreB = scoreOptionContract(b, preferredStrike, side);
+    const scoreA = scoreOptionContract(a, preferredStrike, side);
+
+    if (scoreB !== scoreA) return scoreB - scoreA;
+
+    return Math.abs(a.strike - preferredStrike) - Math.abs(b.strike - preferredStrike);
+  });
+
+  return normalized[0];
 }
 
 // =====================
@@ -636,7 +699,7 @@ ${setup.optionTicker}
 
 💰 سعر السهم الحالي: ${fmtPrice(setup.currentPrice)}
 
-💵 سعر العقد: ${fmtPrice(setup.optionEntry)}
+💵 سعر العقد وقت الاختيار: ${fmtPrice(setup.optionEntry)}
 📉 وقف العقد: ${fmtPrice(setup.optionStop)}
 
 📍 التفعيل:
@@ -692,10 +755,49 @@ async function sendActivatedMessage(setup, price) {
   }
 
   const optionEntry = optionData?.mid || setup.optionEntry || null;
-  const optionStop = optionEntry ? Math.max(optionEntry - CONTRACT_STOP_DROP, 0.01) : setup.optionStop;
+
+  if (
+    !optionEntry ||
+    optionEntry < MIN_CONTRACT_PRICE ||
+    optionEntry > MAX_CONTRACT_PRICE
+  ) {
+    activeSetups.delete(setup.key);
+    activeTrades.delete(setup.key);
+
+    await bot.sendMessage(
+      SIGNALS_CHAT_ID,
+      `❌ تم إلغاء تفعيل الصفقة — ST Decision
+
+📊 السهم: ${setup.symbol}
+النوع: ${sideArabic}
+📅 الانتهاء: ${setup.expiration}
+
+🎯 العقد:
+${setup.optionTicker || 'غير متوفر'}
+
+💵 سعر العقد الحالي: ${fmtPrice(optionEntry)}
+
+📌 السبب:
+سعر العقد خرج عن النطاق المطلوب ${MIN_CONTRACT_PRICE} - ${MAX_CONTRACT_PRICE}
+
+⚠️ ليست توصية شراء أو بيع`
+    );
+
+    return;
+  }
+
+  const optionStop = Math.max(optionEntry - CONTRACT_STOP_DROP, 0.01);
 
   setup.optionEntry = optionEntry;
   setup.optionStop = optionStop;
+  setup.optionBid = optionData?.bid || setup.optionBid;
+  setup.optionAsk = optionData?.ask || setup.optionAsk;
+  setup.optionLast = optionData?.last || setup.optionLast;
+  setup.optionVolume = optionData?.volume || setup.optionVolume;
+  setup.optionOi = optionData?.oi || setup.optionOi;
+  setup.optionDelta = optionData?.delta ?? setup.optionDelta;
+  setup.optionGamma = optionData?.gamma ?? setup.optionGamma;
+
   setup.lastContractUpdatePrice = optionEntry;
   setup.activatedAt = now();
   setup.status = 'ACTIVE';
@@ -723,8 +825,8 @@ TP1: ${setup.tp1 || 'غير متوفر'}
 TP2: ${setup.tp2 || 'غير متوفر'}
 TP3: ${setup.tp3 || 'غير متوفر'}
 
-📦 OI: ${fmtNum(optionData?.oi || setup.optionOi)}
-📊 Volume: ${fmtNum(optionData?.volume || setup.optionVolume)}
+📦 OI: ${fmtNum(setup.optionOi)}
+📊 Volume: ${fmtNum(setup.optionVolume)}
 
 🔔 سيتم إرسال تحديث كلما ارتفع العقد +${CONTRACT_UPDATE_STEP.toFixed(2)}
 
@@ -832,6 +934,14 @@ async function monitorActiveTrades() {
       const optionPrice = optionData.mid;
       if (!optionPrice) continue;
 
+      trade.optionBid = optionData.bid || trade.optionBid;
+      trade.optionAsk = optionData.ask || trade.optionAsk;
+      trade.optionLast = optionData.last || trade.optionLast;
+      trade.optionVolume = optionData.volume || trade.optionVolume;
+      trade.optionOi = optionData.oi || trade.optionOi;
+      trade.optionDelta = optionData.delta ?? trade.optionDelta;
+      trade.optionGamma = optionData.gamma ?? trade.optionGamma;
+
       if (trade.optionStop && optionPrice <= trade.optionStop) {
         activeTrades.delete(key);
 
@@ -871,8 +981,8 @@ ${trade.optionTicker}
 ✅ الربح الحالي: +${fmtPrice(optionPrice - trade.optionEntry)}
 
 🛑 وقف العقد: ${fmtPrice(trade.optionStop)}
-📦 OI: ${fmtNum(optionData.oi)}
-📊 Volume: ${fmtNum(optionData.volume)}`
+📦 OI: ${fmtNum(trade.optionOi)}
+📊 Volume: ${fmtNum(trade.optionVolume)}`
         );
       }
     } catch (err) {
@@ -915,6 +1025,12 @@ bot.on('message', async (msg) => {
 
 نطاق سعر العقد:
 ${MIN_CONTRACT_PRICE} إلى ${MAX_CONTRACT_PRICE}
+
+طريقة اختيار العقد:
+Massive Option Chain مرة واحدة ثم فلترة محلية
+
+طريقة متابعة العقد:
+Snapshot مباشر لنفس العقد بعد التفعيل
 
 تحديث العقد كل:
 +${CONTRACT_UPDATE_STEP.toFixed(2)}
