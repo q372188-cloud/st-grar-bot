@@ -150,7 +150,10 @@ function extractEntry(text, side) {
   if (side === 'CALL') {
     const m =
       text.match(/اختراق\s+([0-9]+(?:\.[0-9]+)?)/) ||
-      text.match(/الدخول\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?)/);
+      text.match(/فوق\s+([0-9]+(?:\.[0-9]+)?)/) ||
+      text.match(/الدخول\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?)/) ||
+      text.match(/Entry\s*[:：]?\s*\$?([0-9]+(?:\.[0-9]+)?)/i) ||
+      text.match(/Activation\s*[:：]?\s*\$?([0-9]+(?:\.[0-9]+)?)/i);
 
     if (m) return Number(m[1]);
   }
@@ -158,14 +161,56 @@ function extractEntry(text, side) {
   if (side === 'PUT') {
     const m =
       text.match(/كسر\s+([0-9]+(?:\.[0-9]+)?)/) ||
-      text.match(/الدخول\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?)/);
+      text.match(/تحت\s+([0-9]+(?:\.[0-9]+)?)/) ||
+      text.match(/الدخول\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?)/) ||
+      text.match(/Entry\s*[:：]?\s*\$?([0-9]+(?:\.[0-9]+)?)/i) ||
+      text.match(/Activation\s*[:：]?\s*\$?([0-9]+(?:\.[0-9]+)?)/i);
 
+    if (m) return Number(m[1]);
+  }
+
+  const m =
+    text.match(/الدخول\s*[:：]?\s*([0-9]+(?:\.[0-9]+)?)/) ||
+    text.match(/Entry\s*[:：]?\s*\$?([0-9]+(?:\.[0-9]+)?)/i);
+
+  return m ? Number(m[1]) : null;
+}
+
+function extractCurrentPriceFromText(text) {
+  const patterns = [
+    /سعر السهم الحالي:\s*([0-9]+(?:\.[0-9]+)?)/,
+    /السعر الحالي:\s*([0-9]+(?:\.[0-9]+)?)/,
+    /💰\s*سعر السهم الحالي:\s*([0-9]+(?:\.[0-9]+)?)/,
+    /💵\s*السعر الحالي:\s*([0-9]+(?:\.[0-9]+)?)/,
+    /Current Price:\s*\$?([0-9]+(?:\.[0-9]+)?)/i,
+    /Price:\s*\$?([0-9]+(?:\.[0-9]+)?)/i
+  ];
+
+  for (const p of patterns) {
+    const m = text.match(p);
     if (m) return Number(m[1]);
   }
 
   return null;
 }
 
+function isReadyText(text) {
+  return (
+    text.includes('جاهزة') ||
+    text.includes('جاهز') ||
+    text.includes('دخول الآن') ||
+    text.includes('دخول الان') ||
+    text.includes('ادخل الآن') ||
+    text.includes('ادخل الان') ||
+    text.includes('تفعيل الآن') ||
+    text.includes('تفعيل الان') ||
+    text.includes('Ready Now') ||
+    text.includes('READY NOW') ||
+    text.includes('Entry Now') ||
+    text.includes('ENTRY NOW') ||
+    text.includes('NOW')
+  );
+}
 function extractTargets(text) {
   const tp1 = extractNumberAfter('TP1', text);
   const tp2 = extractNumberAfter('TP2', text);
@@ -322,6 +367,7 @@ async function getMassiveOptionChain(symbol, expiration, side) {
 
   return all;
 }
+
 // =====================
 // Option Selection
 // =====================
@@ -424,7 +470,6 @@ async function findBestOptionContract(symbol, expiration, side, preferredStrike)
 
   return normalized[0];
 }
-
 // =====================
 // Parsers
 // =====================
@@ -435,7 +480,13 @@ function parseGex(text) {
 
   const side = extractBiasFromGex(text);
   const score = extractScore(text);
-  const entry = extractEntry(text, side);
+
+  const explicitEntry = extractEntry(text, side);
+  const messagePrice = extractCurrentPriceFromText(text);
+  const readyText = isReadyText(text);
+
+  const entry = explicitEntry || (readyText ? messagePrice : null);
+
   const targets = extractTargets(text);
   const stop = extractStop(text);
   const strike = getStrikeFromEntry(entry, side);
@@ -446,6 +497,9 @@ function parseGex(text) {
     side,
     score,
     entry,
+    explicitEntry,
+    messagePrice,
+    readyText,
     stop,
     strike,
     tp1: targets.tp1,
@@ -547,10 +601,10 @@ function canCreateDecision(gex, radar) {
     };
   }
 
-  if (!gex.entry) {
+  if (!gex.entry && !gex.readyText) {
     return {
       ok: false,
-      reason: 'لا يوجد مستوى دخول واضح'
+      reason: 'لا يوجد مستوى دخول واضح ولا إشارة جاهزة'
     };
   }
 
@@ -561,10 +615,10 @@ function canCreateDecision(gex, radar) {
     };
   }
 
-  if (!gex.strike) {
+  if (!gex.strike && !gex.entry && !gex.readyText) {
     return {
       ok: false,
-      reason: 'لا يوجد سترايك مبدئي واضح'
+      reason: 'لا يوجد سترايك أو دخول واضح'
     };
   }
 
@@ -586,6 +640,28 @@ async function createWatchSetup(symbol, gex, radar) {
 
   if (expiration === 'غير متوفر') {
     console.log(`NO DECISION ${symbol}: لا يوجد انتهاء مقترح`);
+    return;
+  }
+
+  let currentPrice = null;
+
+  try {
+    currentPrice = await getFinnhubPrice(symbol);
+  } catch (err) {
+    console.error('FINNHUB PRICE ERROR:', symbol, err.message);
+    return;
+  }
+
+  if (!gex.entry && gex.readyText) {
+    gex.entry = currentPrice;
+  }
+
+  if (!gex.strike && gex.entry) {
+    gex.strike = getStrikeFromEntry(gex.entry, gex.side);
+  }
+
+  if (!gex.entry || !gex.strike) {
+    console.log(`NO DECISION ${symbol}: لا يوجد دخول أو سترايك بعد فحص السعر`);
     return;
   }
 
@@ -627,14 +703,13 @@ async function createWatchSetup(symbol, gex, radar) {
 
   sentSetupKeys.add(setupKey);
 
-  const currentPrice = await getFinnhubPrice(symbol);
-
   const setup = {
     key: setupKey,
     symbol,
     side: gex.side,
     entry: gex.entry,
     stop: gex.stop,
+    readyText: gex.readyText,
 
     preferredStrike: gex.strike,
     strike: optionData.strike,
@@ -662,17 +737,18 @@ async function createWatchSetup(symbol, gex, radar) {
     status: 'WATCHING'
   };
 
-const readyNow =
-  setup.side === 'CALL'
-    ? setup.currentPrice >= setup.entry
-    : setup.currentPrice <= setup.entry;
+  const readyNow =
+    setup.readyText ||
+    (setup.side === 'CALL'
+      ? setup.currentPrice >= setup.entry
+      : setup.currentPrice <= setup.entry);
 
-if (readyNow) {
-  console.log('READY NOW SETUP:', setupKey);
-  await sendActivatedMessage(setup, setup.currentPrice);
-  return;
-}
-  
+  if (readyNow) {
+    console.log('READY NOW SETUP:', setupKey);
+    await sendActivatedMessage(setup, setup.currentPrice);
+    return;
+  }
+
   activeSetups.set(setupKey, setup);
 
   await sendWatchMessage(setup, gex, radar);
@@ -825,7 +901,7 @@ ${sideEmoji} النوع: ${sideArabic}
 ${setup.optionTicker || 'غير متوفر'}
 
 💰 سعر السهم الحالي: ${fmtPrice(price)}
-📍 مستوى التفعيل: ${fmtPrice(setup.entry)}
+📍 مستوى الدخول: ${fmtPrice(setup.entry)}
 
 💵 دخول العقد: ${fmtPrice(optionEntry)}
 🛑 وقف العقد: ${fmtPrice(optionStop)}
@@ -1039,6 +1115,9 @@ ${MIN_CONTRACT_PRICE} إلى ${MAX_CONTRACT_PRICE}
 
 طريقة اختيار العقد:
 Massive Option Chain مرة واحدة ثم فلترة محلية
+
+طريقة الدخول:
+اختراق / كسر / دخول الآن / جاهزة
 
 طريقة متابعة العقد:
 Snapshot مباشر لنفس العقد بعد التفعيل
