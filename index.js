@@ -141,22 +141,51 @@ function extractBiasFromGex(text) {
 }
 
 function extractRadarSide(text) {
+  // 1) أولوية الخلاصة النهائية للرادار
   if (
-    text.includes('تابع الكول') ||
+    text.includes('حسب المعطيات الحالية: انتظر') ||
+    text.includes('انتظر') ||
+    text.includes('لا يوجد توافق كاف') ||
+    text.includes('تدفق العقود غير حاسم')
+  ) {
+    return 'NEUTRAL';
+  }
+
+  if (
     text.includes('مراقبة كول') ||
-    text.includes('سيطرة الكول') ||
-    text.includes('المشترون يسيطرون') ||
-    text.includes('الكول يسيطر')
+    text.includes('تابع الكول') ||
+    text.includes('متابعة كول') ||
+    text.includes('دخول كول')
   ) {
     return 'CALL';
   }
 
   if (
-    text.includes('تابع البوت') ||
     text.includes('مراقبة بوت') ||
+    text.includes('تابع البوت') ||
+    text.includes('متابعة بوت') ||
+    text.includes('دخول بوت')
+  ) {
+    return 'PUT';
+  }
+
+  // 2) مؤشرات ثانوية فقط إذا لا توجد خلاصة واضحة
+  if (
+    text.includes('سيطرة الكول') ||
+    text.includes('الكول يسيطر') ||
+    text.includes('المشترون يسيطرون') ||
+    text.includes('المشترون يسيطرون على الـ Ask') ||
+    text.includes('التحوط الشرائي مسيطر')
+  ) {
+    return 'CALL';
+  }
+
+  if (
     text.includes('سيطرة البوت') ||
+    text.includes('البوت يسيطر') ||
     text.includes('البائعون يضغطون') ||
-    text.includes('البوت يسيطر')
+    text.includes('البائعون يضغطون على الـ Bid') ||
+    text.includes('التحوط البيعي مسيطر')
   ) {
     return 'PUT';
   }
